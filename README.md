@@ -18,8 +18,8 @@ Requires Xcode (or its command line tools) and macOS 27.
 ```sh
 git clone https://github.com/anishmanchanda/SpaceSwipe.git
 cd SpaceSwipe
-./build.sh                       # builds, signs, self-tests, installs to ~/Applications
-open ~/Applications/SpaceSwipe.app
+./build.sh                       # builds, signs, self-tests, installs to /Applications
+open /Applications/SpaceSwipe.app
 ```
 
 `build.sh` signs with your first code-signing identity (an Apple Development certificate works). Keeping the same identity keeps the Accessibility permission valid across rebuilds. Without one, it falls back to ad-hoc signing, and you'll need to re-grant the permission after every build.
