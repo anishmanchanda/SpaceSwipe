@@ -14,14 +14,16 @@ let defaultSettings: [String: Any] = [
     "commitAt": 0.6,         // fraction of a Space past which a stop switches; below it snaps back
     "idleEnd": 0.15,         // seconds without wheel input that count as "stopped" (fallback)
     "reverse": false,        // flip the swipe direction
+    "middleButtonSwipe": true, // hold a mouse button + thumb wheel to switch Spaces anywhere, not just in Mission Control
+    "swipeButton": 2,          // which button: 2 = middle (wheel click), 3 = back, 4 = forward
 ]
-var pointsPerSpace = 500.0, commitAt = 0.6, idleEnd = 0.15, reverse = false
+var pointsPerSpace = 500.0, commitAt = 0.6, idleEnd = 0.15, reverse = false, middleSwipe = true, swipeButton = 2
 
 func loadSettings() {
     let fm = FileManager.default
     if !fm.fileExists(atPath: settingsURL.path) {
         try? fm.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let text = "{\n  \"pointsPerSpace\": 500,\n  \"commitAt\": 0.6,\n  \"idleEnd\": 0.15,\n  \"reverse\": false\n}\n"
+        let text = "{\n  \"pointsPerSpace\": 500,\n  \"commitAt\": 0.6,\n  \"idleEnd\": 0.15,\n  \"reverse\": false,\n  \"middleButtonSwipe\": true,\n  \"swipeButton\": 2\n}\n"
         fm.createFile(atPath: settingsURL.path, contents: text.data(using: .utf8))
     }
     var s = defaultSettings
@@ -32,6 +34,8 @@ func loadSettings() {
     commitAt = (s["commitAt"] as? NSNumber)?.doubleValue ?? 0.6
     idleEnd = max((s["idleEnd"] as? NSNumber)?.doubleValue ?? 0.15, 0.02)
     reverse = (s["reverse"] as? Bool) ?? false
+    middleSwipe = (s["middleButtonSwipe"] as? Bool) ?? true
+    swipeButton = min(max((s["swipeButton"] as? NSNumber)?.intValue ?? 2, 2), 15)
 }
 var enabled = defaults.object(forKey: "enabled") as? Bool ?? true
 var debug = defaults.bool(forKey: "debug")
@@ -200,13 +204,55 @@ let gesture = Gesture()
 
 var tap: CFMachPort?
 
+// Middle button + thumb wheel. The button press is held back until we know whether it is a click or the
+// start of a swipe: a plain click is replayed on release (so it registers on release, not press), a drag
+// past `dragSlop` points is replayed as a normal middle-drag, and a press that scrolled is swallowed.
+// All of this runs on the main thread (the tap is on the main run loop).
+var middleHeld = false, middleScrolled = false, middlePassed = false, middleMoved = 0.0, middleTail = 0.0
+var middleDown: CGEvent?
+let replayTag: Int64 = 0x5353_5750 // "SSWP": marks events we re-post so the tap ignores them
+let dragSlop = 8.0                 // cursor travel (points) before a held middle button counts as a drag
+
+func replay(_ events: [CGEvent?]) {
+    let copies = events.compactMap { $0?.copy() }
+    copies.forEach { $0.setIntegerValueField(.eventSourceUserData, value: replayTag) }
+    DispatchQueue.main.async { copies.forEach { $0.post(tap: .cgSessionEventTap) } }
+}
+
+func middleButton(_ type: CGEventType, _ event: CGEvent, _ pass: Unmanaged<CGEvent>?) -> Unmanaged<CGEvent>? {
+    if type != .otherMouseDragged { log("tap sees mouse button \(event.getIntegerValueField(.mouseEventButtonNumber)) \(type == .otherMouseDown ? "down" : "up")") }
+    switch type {
+    case .otherMouseDown:
+        guard enabled, middleSwipe, event.getIntegerValueField(.mouseEventButtonNumber) == Int64(swipeButton) else { return pass }
+        middleHeld = true; middleScrolled = false; middlePassed = false; middleMoved = 0; middleDown = event.copy()
+        log("button down (held back)")
+        return nil
+    case .otherMouseUp:
+        guard middleHeld, event.getIntegerValueField(.mouseEventButtonNumber) == Int64(swipeButton) else { return pass }
+        middleHeld = false
+        log("middle up scrolled=\(middleScrolled) dragged=\(middlePassed)")
+        if middlePassed { return pass }                                  // was a drag: the app already has the press
+        if middleScrolled { DispatchQueue.main.async { gesture.finish() }; return nil } // fingers lifted
+        replay([middleDown, event]); return nil                          // plain click
+    default: // .otherMouseDragged
+        guard middleHeld, !middlePassed else { return pass }
+        if middleScrolled { return nil }
+        middleMoved += hypot(event.getDoubleValueField(.mouseEventDeltaX), event.getDoubleValueField(.mouseEventDeltaY))
+        if middleMoved < dragSlop { return nil }                         // hand tremor while pressing
+        middlePassed = true; replay([middleDown, event]); return nil
+    }
+}
+
 let tapCallback: CGEventTapCallBack = { _, type, event, _ in
     let pass = Unmanaged.passUnretained(event)
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         log("tap disabled (\(type.rawValue)), re-enabling")
+        middleHeld = false // we may have missed the button release
         if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
         return pass
     }
+    if event.getIntegerValueField(.eventSourceUserData) == replayTag { return pass }
+    if [.otherMouseDown, .otherMouseUp, .otherMouseDragged].contains(type) { return middleButton(type, event, pass) }
     guard enabled, type == .scrollWheel else { return pass }
     let line = event.getIntegerValueField(.scrollWheelEventDeltaAxis2)
     let point = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
@@ -215,8 +261,12 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
 
     refreshMC()                                                                      // async, never blocks
     let open = mcIsOpen
-    log("h-scroll line=\(line) point=\(point) cont=\(event.getIntegerValueField(.scrollWheelEventIsContinuous)) phase=\(event.getIntegerValueField(.scrollWheelEventScrollPhase)) momentum=\(event.getIntegerValueField(.scrollWheelEventMomentumPhase)) mc=\(open)")
-    guard open else { return pass }
+    let viaMiddle = middleSwipe && middleHeld && !middlePassed
+    log("h-scroll line=\(line) point=\(point) cont=\(event.getIntegerValueField(.scrollWheelEventIsContinuous)) phase=\(event.getIntegerValueField(.scrollWheelEventScrollPhase)) momentum=\(event.getIntegerValueField(.scrollWheelEventMomentumPhase)) mc=\(open) button=\(viaMiddle)")
+    let now = CACurrentMediaTime()
+    if viaMiddle { middleScrolled = true; middleTail = now + 0.4 }
+    else if !open && now < middleTail { return nil }                                 // wheel momentum after letting go of the button
+    guard open || viaMiddle else { return pass }
     let delta = point != 0 ? point : Double(line) * 10
     let stopped = [4, 8].contains(event.getIntegerValueField(.scrollWheelEventScrollPhase)) // wheel driver says motion ended
     DispatchQueue.main.async { gesture.feed(delta, wheelStopped: stopped) }
@@ -224,7 +274,8 @@ let tapCallback: CGEventTapCallBack = { _, type, event, _ in
 }
 
 func startTap() -> Bool {
-    let mask = CGEventMask(1 << CGEventType.scrollWheel.rawValue)
+    let mask = [CGEventType.scrollWheel, .otherMouseDown, .otherMouseUp, .otherMouseDragged]
+        .reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
     guard let t = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                                     eventsOfInterest: mask, callback: tapCallback, userInfo: nil) else { return false }
     tap = t
@@ -266,7 +317,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func update() {
         enabledItem.state = enabled ? .on : .off
         debugItem.state = debug ? .on : .off
-        statusLine.title = tap == nil ? "Waiting for Accessibility permission…" : (enabled ? "Active in Mission Control" : "Off")
+        statusLine.title = tap == nil ? "Waiting for Accessibility permission…" : (enabled ? (middleSwipe ? "Active (Mission Control, middle button + wheel)" : "Active in Mission Control") : "Off")
         item.button?.image = NSImage(systemSymbolName: enabled ? "rectangle.split.3x1.fill" : "rectangle.split.3x1",
                                      accessibilityDescription: "SpaceSwipe")
     }
@@ -278,7 +329,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func toggleDebug() { debug.toggle(); defaults.set(debug, forKey: "debug"); update(); log("debug logging on") }
     @objc func editSettings() { loadSettings(); NSWorkspace.shared.open(settingsURL) }
-    @objc func reloadSettings() { loadSettings(); log("settings: pointsPerSpace=\(pointsPerSpace) commitAt=\(commitAt) idleEnd=\(idleEnd) reverse=\(reverse)") }
+    @objc func reloadSettings() { loadSettings(); update(); log("settings: pointsPerSpace=\(pointsPerSpace) commitAt=\(commitAt) idleEnd=\(idleEnd) reverse=\(reverse) middleButtonSwipe=\(middleSwipe)") }
     @objc func openLog() { log("open log"); logQueue.async { DispatchQueue.main.async { NSWorkspace.shared.open(logURL) } } }
 }
 
